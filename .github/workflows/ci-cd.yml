@@ -197,6 +197,11 @@ jobs:
   deploy-docker:
     needs: [build]  #, build-docs]
     runs-on: ubuntu-latest
+    # Fork release: the repository default token is read-only, so grant
+    # this job alone the right to push the image to ghcr.io.
+    permissions:
+      contents: read
+      packages: write
     steps:
     - uses: actions/checkout@v2
 
