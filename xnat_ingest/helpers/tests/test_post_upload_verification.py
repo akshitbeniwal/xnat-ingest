@@ -8,7 +8,17 @@ dict comparison calls that a mismatch when nothing is wrong.
 The comparison is per file, so a file with no digest is trusted by name.
 """
 
-from xnat_ingest.helpers.remotes import compare_resource_with_xnat
+import logging
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from xnat_ingest.helpers.remotes import (
+    compare_resource_with_xnat,
+    get_xnat_resource,
+    warn_if_compared_by_name_only,
+)
 
 CALCULATED = {
     "old1.dcm": "aaa",
@@ -100,3 +110,93 @@ def test_no_digests_and_all_names_present_is_a_pass() -> None:
     comparison = compare_resource_with_xnat(CALCULATED, remote)
     assert not comparison.comparable
     assert comparison.complete
+
+
+def test_a_name_only_comparison_is_logged_as_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A site with checksums off lists every file without a digest. The upload
+    log then carries one WARNING that names the resource and the session, so a
+    clean log is not read as a checksum match."""
+    comparison = compare_resource_with_xnat(CALCULATED, {k: "" for k in CALCULATED})
+    assert comparison.complete
+    assert not comparison.comparable
+
+    with caplog.at_level(logging.WARNING, logger="xnat-ingest"):
+        warn_if_compared_by_name_only(comparison, "1:DICOM", "PROJECT.SUBJECT.SESSION")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "compared by file name only" in warnings[0]
+    assert "1:DICOM" in warnings[0] and "PROJECT.SUBJECT.SESSION" in warnings[0]
+
+
+def test_a_comparison_with_digests_logs_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    comparison = compare_resource_with_xnat(CALCULATED, dict(CALCULATED))
+    assert comparison.comparable
+
+    with caplog.at_level(logging.WARNING, logger="xnat-ingest"):
+        warn_if_compared_by_name_only(comparison, "1:DICOM", "PROJECT.SUBJECT.SESSION")
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_partial_digests_warn_without_changing_comparison(caplog):
+    remote = dict(CALCULATED, **{"new1.dcm": "", "new2.dcm": ""})
+    comparison = compare_resource_with_xnat(CALCULATED, remote)
+    assert comparison.complete and comparison.comparable
+    assert comparison.without_checksums == {"new1.dcm", "new2.dcm"}
+    with caplog.at_level(logging.WARNING, logger="xnat-ingest"):
+        warn_if_compared_by_name_only(comparison, "1:DICOM", "SESSION")
+    assert "2 file(s) compared by file name only" in caplog.text
+    remote["old1.dcm"] = "wrong"
+    assert compare_resource_with_xnat(CALCULATED, remote).differing == {"old1.dcm"}
+
+
+@pytest.mark.parametrize("scan_level", [False, True])
+@pytest.mark.parametrize("repair", [False, True])
+def test_existing_resource_warns_once_per_attempt(caplog, scan_level, repair):
+    remote_resource = object()
+    session = SimpleNamespace(
+        label="SESSION",
+        xnat_session=SimpleNamespace(classes=SimpleNamespace()),
+        resources={"REPORT": remote_resource},
+        scans={
+            "1": SimpleNamespace(resources={"REPORT": remote_resource}, files=["a"])
+        },
+    )
+    resource = SimpleNamespace(
+        name="REPORT",
+        path="1:REPORT" if scan_level else "REPORT",
+        scan=SimpleNamespace(id="1", path="SESSION:1") if scan_level else None,
+        fileset=object(),
+        checksums={"a": "aaa", "b": "bbb"},
+    )
+    before = {"a": ""} if repair else {"a": "", "b": ""}
+    warned = set()
+    with (
+        caplog.at_level(logging.WARNING, logger="xnat-ingest"),
+        patch("xnat_ingest.helpers.remotes.get_xnat_checksums", return_value=before),
+    ):
+        result = get_xnat_resource(resource, session, warned_resources=warned)
+        assert result == ((remote_resource, {"b"}) if repair else (None, None))
+        # The uploader's post-upload check shares the attempt's warning set.
+        complete = compare_resource_with_xnat(resource.checksums, {"a": "", "b": ""})
+        warn_if_compared_by_name_only(complete, resource.path, "SESSION", warned)
+    warnings = [r for r in caplog.records if "compared by file name only" in r.message]
+    assert len(warnings) == 1
+    assert "SESSION" in warnings[0].message and resource.path in warnings[0].message
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xnat-ingest"):
+        warn_if_compared_by_name_only(complete, resource.path, "SESSION", set())
+    assert "compared by file name only" in caplog.text
+
+
+def test_empty_remote_listing_does_not_claim_a_name_comparison(caplog):
+    comparison = compare_resource_with_xnat(CALCULATED, {})
+    assert comparison.missing == set(CALCULATED)
+    with caplog.at_level(logging.WARNING, logger="xnat-ingest"):
+        warn_if_compared_by_name_only(comparison, "1:DICOM", "SESSION")
+    assert not caplog.records
