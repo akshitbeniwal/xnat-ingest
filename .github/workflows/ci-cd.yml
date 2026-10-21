@@ -245,7 +245,8 @@ jobs:
           ${{ steps.versions.outputs.IMAGE }}:latest
 
   deploy-docs:
-    if: github.event_name == 'release'
+    # Fork release: the documentation site is upstream's; do not publish a copy.
+    if: false
     needs: [build-docs, deploy-pypi]
     runs-on: ubuntu-latest
     permissions:
