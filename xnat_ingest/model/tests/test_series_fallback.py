@@ -3,7 +3,12 @@
 import pytest
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, MRImageStorage
-from test_from_orthanc import FakeOrthanc, _patch_requests, _publication_kwargs
+from test_from_orthanc import (
+    FakeOrthanc,
+    _patch_requests,
+    _processed,
+    _publication_kwargs,
+)
 
 from xnat_ingest.model.session import ImagingSession
 
@@ -66,7 +71,7 @@ def test_optional_series_tags_do_not_block_study(tmp_path, number, description, 
         ]
         assert len(events) == 1
         assert events[0].orthanc_series_id == "study-series1"
-    assert fake.labelled == [("study", "done")]
+    assert _processed(fake) == [("study", "done")]
     for resource in sessions[0].resources:
         resource.check_checksums()
 
@@ -109,7 +114,7 @@ def test_two_unnumbered_series_remain_separate(tmp_path):
         "Series_1_2_3_4",
         "Series_1_2_3_5",
     }
-    assert fake.labelled == [("study", "done")]
+    assert _processed(fake) == [("study", "done")]
     # FrameTree keys its resource entries by type/resource, not by scan ID.
     # Calling every unnamed type "unknown" would collide during column selection.
     from xnat_ingest.model.store import ImagingSessionMockStore
