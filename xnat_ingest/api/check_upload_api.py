@@ -1,5 +1,4 @@
 import logging
-import pprint
 import subprocess as sp
 import tempfile
 import typing as ty
@@ -19,6 +18,7 @@ from xnat_ingest.helpers.remotes import (
     DEFAULT_MAX_WORKERS,
     LocalSessionListing,
     SessionListing,
+    compare_resource_with_xnat,
     get_xnat_checksums,
     iterate_s3_sessions,
 )
@@ -275,28 +275,34 @@ def check_upload(
                 checksums,
                 _,
             ), xchecksums in zip(to_check, all_xchecksums):
-                if not any(xchecksums.values()):
-                    logger.debug(
-                        "Skipping checksum check for '%s' resource in '%s' in %s as "
-                        "no checksums found on XNAT",
+                unchecked = {
+                    name
+                    for name in checksums.keys() & xchecksums.keys()
+                    if not (checksums[name] and xchecksums[name])
+                }
+                try:
+                    sizes = (
+                        session_listing.resource_file_sizes(
+                            f"{scan_path}/{resource_name}", unchecked
+                        )
+                        if unchecked
+                        else {}
+                    )
+                except (OSError, ValueError, AttributeError):
+                    logger.error(
+                        "Cannot verify staged file sizes for '%s' in %s",
                         resource_name,
-                        scan_path,
                         session_desc,
                     )
-                elif sorted(checksums.values()) != sorted(xchecksums.values()):
-                    fnames = set(checksums)
-                    xfnames = set(xchecksums)
-                    missing = xfnames - fnames
-                    extra = fnames - xfnames
-                    differing = {
-                        k: (xchecksums[k], checksums[k])
-                        for k in fnames & xfnames
-                        if xchecksums[k] != checksums[k]
-                    }
+                    num_issues += 1
+                    continue
+                comparison = compare_resource_with_xnat(
+                    checksums, xchecksums, local_sizes=sizes
+                )
+                if not comparison.complete:
                     logger.error(
                         "CHECKSUM FAIL - '%s' resource in '%s' in %s already exists "
-                        "on XNAT with different files/checksums. Please delete on XNAT to "
-                        "overwrite:\n",
+                        "on XNAT with different or unverified files/checksums/sizes:\n",
                         resource_name,
                         scan_path,
                         session_desc,
@@ -305,10 +311,12 @@ def check_upload(
                         "Checksum differences are:\n"
                         "    missing: %s\n"
                         "    extra: %s\n"
-                        "    differing checksums:\n%s",
-                        list(missing),
-                        list(extra),
-                        pprint.pformat(differing),
+                        "    differing files: %s\n"
+                        "    unverified sizes: %s",
+                        sorted(comparison.missing),
+                        sorted(comparison.extra),
+                        sorted(comparison.differing),
+                        sorted(comparison.unverified),
                     )
                     num_issues += 1
 

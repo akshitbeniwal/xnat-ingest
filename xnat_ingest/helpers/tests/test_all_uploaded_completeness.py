@@ -119,7 +119,7 @@ class FakeXnat:
             {
                 "ResultSet": {
                     "Result": [
-                        {"Name": n, "URI": f"{uri}/{n}", "digest": d}
+                        {"Name": n, "URI": f"{uri}/{n}", "digest": d, "Size": "1"}
                         for n, d in files.items()
                     ]
                 }
@@ -139,6 +139,9 @@ def _listing(
         @property
         def resource_manifests(self) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
             return {p: {"checksums": c} for p, c in manifests.items()}
+
+        def resource_file_sizes(self, resource_path, names):
+            return {name: 1 for name in names}
 
     return Listing(name="proj.subj.sess", objects=[], bucket=None, cache_path=tmp_path)
 
@@ -205,10 +208,10 @@ def test_empty_digests_do_not_make_a_complete_resource_look_short(
     assert listing.all_uploaded(xnat) is True  # type: ignore[arg-type]
 
 
-def test_no_manifest_falls_back_to_previous_behaviour(tmp_path: ty.Any) -> None:
-    """Sessions staged without manifests must not become newly unskippable."""
+def test_no_manifest_cannot_verify_completion(tmp_path: ty.Any) -> None:
+    """An existing resource label cannot verify a session without a manifest."""
     listing = _listing(tmp_path, {RESOURCE_PATH: {}})
-    assert listing.all_uploaded(_one_scan({})) is True  # type: ignore[arg-type]
+    assert listing.all_uploaded(_one_scan({})) is False  # type: ignore[arg-type]
 
 
 def test_unreadable_manifests_do_not_vote_the_session_complete(

@@ -10,12 +10,14 @@ content, are still an error for a human to resolve.
 """
 
 import typing as ty
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from xnat_ingest.exceptions import IncompleteCheckumsException
-from xnat_ingest.helpers.remotes import get_xnat_resource
+from xnat_ingest.helpers.remotes import FileChecksums, get_xnat_resource
 
 
 class FakeResourceOnXnat:
@@ -46,7 +48,7 @@ class FakeStagedResource:
     scan = FakeStagedScan()
     # not a DicomCollection, so the resource keeps the name it was staged under rather
     # than one derived from the SOP class -- these tests are about checksum repair
-    fileset = None
+    fileset = SimpleNamespace(parent=Path("/staged"))
     metadata: dict[str, object] = {}
     path = "test_project:SUBJ:SESS:2-t1_mprage_ax:DICOM"
 
@@ -61,8 +63,15 @@ def _staged(n: int) -> dict[str, str]:
 def _call(staged: dict[str, str], on_xnat: dict[str, str]) -> ty.Any:
     resource = FakeStagedResource(staged)
     xsession = FakeXnatSession(FakeScan({"DICOM": FakeResourceOnXnat()}))
-    with mock.patch(
-        "xnat_ingest.helpers.remotes.get_xnat_checksums", return_value=on_xnat
+    with (
+        mock.patch(
+            "xnat_ingest.helpers.remotes.file_sizes",
+            return_value={name: 1 for name in staged},
+        ),
+        mock.patch(
+            "xnat_ingest.helpers.remotes.get_xnat_checksums",
+            return_value=FileChecksums(on_xnat, sizes={name: 1 for name in on_xnat}),
+        ),
     ):
         return get_xnat_resource(resource, xsession)
 
@@ -94,14 +103,17 @@ def test_complete_resource_still_skips_quietly() -> None:
 def test_extra_files_on_xnat_are_not_repaired() -> None:
     """XNAT holding files we do not is a conflict, not something to auto-repair.
 
-    An upload can only add, so it cannot resolve this. The existing behaviour is
-    kept: log and skip, leaving it to a human.
+    An upload can only add, so it cannot resolve this. The resource must raise an integrity error rather than
+    returning the same result as an already complete resource.
     """
     staged = _staged(3)
     on_xnat = dict(staged)
     on_xnat["unexpected.dcm"] = "digestX"
 
-    assert _call(staged, on_xnat) == (None, None)
+    with pytest.raises(
+        IncompleteCheckumsException, match="cannot be reported complete"
+    ):
+        _call(staged, on_xnat)
 
 
 def test_missing_alongside_extra_files_still_raises() -> None:
@@ -129,7 +141,10 @@ def test_differing_content_is_not_repaired() -> None:
     on_xnat = dict(staged)
     on_xnat["slice1.dcm"] = "SOMETHING_ELSE"
 
-    assert _call(staged, on_xnat) == (None, None)
+    with pytest.raises(
+        IncompleteCheckumsException, match="cannot be reported complete"
+    ):
+        _call(staged, on_xnat)
 
 
 def test_empty_digests_do_not_make_a_complete_resource_look_broken() -> None:
