@@ -66,7 +66,7 @@ class FakeConnection:
             {
                 "ResultSet": {
                     "Result": [
-                        {"Name": n, "URI": f"{uri}/{n}", "digest": d}
+                        {"Name": n, "URI": f"{uri}/{n}", "digest": d, "Size": "1"}
                         for n, d in self.on_xnat.items()
                     ]
                 }

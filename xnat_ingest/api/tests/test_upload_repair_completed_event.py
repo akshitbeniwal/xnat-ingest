@@ -27,6 +27,7 @@ from xnat_ingest.api import upload_api
 from xnat_ingest.api.upload_api import upload
 from xnat_ingest.exceptions import IncompleteCheckumsException
 from xnat_ingest.helpers.logging import JsonFormatter, logger
+from xnat_ingest.helpers.remotes import FileChecksums
 
 EVENT = "xnat_repair_completed"
 UPLOADED = "Successfully uploaded all files in"
@@ -41,19 +42,23 @@ class FakeXResource:
 
     def __init__(self, held: set[str], outcome: str) -> None:
         self.held = set(held)
+        self.sizes = {name: len(b"already on XNAT") for name in held}
         self.outcome = outcome  # "lands" | "raises" | "lost"
 
     def upload_dir(self, upload_dir: Path, method: str) -> None:
         if self.outcome == "raises":
             raise ConnectionError("simulated XNAT upload failure")
         if self.outcome == "lands":
-            self.held |= {p.name for p in Path(upload_dir).rglob("*") if p.is_file()}
+            for path in Path(upload_dir).rglob("*"):
+                if path.is_file():
+                    self.held.add(path.name)
+                    self.sizes[path.name] = path.stat().st_size
         # "lost": the call returns but XNAT never lists the files
 
     def listing(self) -> dict[str, str]:
         # Names only, as on a site without enableChecksums: the real
         # compare_resource_with_xnat still fails on a missing name.
-        return {name: "" for name in self.held}
+        return FileChecksums({name: "" for name in self.held}, sizes=self.sizes)
 
 
 class FakeExperiment:

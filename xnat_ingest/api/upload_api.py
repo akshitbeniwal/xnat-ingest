@@ -23,6 +23,7 @@ from xnat_ingest.helpers.remotes import (
     calculate_checksums,
     compare_resource_with_xnat,
     dir_older_than,
+    file_sizes,
     get_xnat_checksums,
     get_xnat_resource,
     get_xnat_session,
@@ -455,40 +456,31 @@ def upload(
                                     upload_method,
                                 )
                                 xresource.upload_dir(upload_dir, method=upload_method)
+                    # A successful PUT is not evidence that every byte landed.
+                    # Even --dont-check-checksums still verifies names and sizes;
+                    # it avoids hashing the local file contents, not verification.
+                    remote_checksums = get_xnat_checksums(xresource)
                     if check_checksums:
-                        logger.debug("retrieving checksums for %s", xresource)
-                        remote_checksums = get_xnat_checksums(xresource)
-                        # Names are always available, digests are not, so this
-                        # runs either way rather than being skipped on a site
-                        # without enableChecksums.
                         logger.debug("calculating checksums for %s", xresource)
                         calc_checksums = calculate_checksums(resource.fileset)
-                        # Compared file by file, not as two whole dicts. A
-                        # resource just topped up holds real digests for the
-                        # files already there and empty ones for those just
-                        # added, and a whole-dict `!=` calls that a mismatch.
-                        comparison = compare_resource_with_xnat(
-                            calc_checksums, remote_checksums
-                        )
-                        warn_if_compared_by_name_only(
-                            comparison, resource.path, session.name, warned_resources
-                        )
-                        if not comparison.complete:
-                            raise RuntimeError(
-                                "Checksums do not match after upload of "
-                                f"'{resource.path}' resource.\n"
-                                f"Extra keys were {sorted(comparison.extra)}\n"
-                                f"Missing keys were {sorted(comparison.missing)}\n"
-                                "Mismatching files were "
-                                f"{sorted(comparison.differing)}\n"
-                                f"Remote checksums were {remote_checksums}\n"
-                                f"Calculated checksums were {calc_checksums}\n"
-                            )
                     else:
-                        logger.debug(
-                            "Not checking checksums for '%s' resource as checksum "
-                            "checking is disabled",
-                            resource.path,
+                        calc_checksums = {name: "" for name in resource.checksums}
+                    comparison = compare_resource_with_xnat(
+                        calc_checksums,
+                        remote_checksums,
+                        local_sizes=file_sizes(resource.fileset.parent, calc_checksums),
+                    )
+                    warn_if_compared_by_name_only(
+                        comparison, resource.path, session.name, warned_resources
+                    )
+                    if not comparison.complete:
+                        raise RuntimeError(
+                            "Checksums or file sizes do not match after upload of "
+                            f"'{resource.path}' resource.\n"
+                            f"Extra keys were {sorted(comparison.extra)}\n"
+                            f"Missing keys were {sorted(comparison.missing)}\n"
+                            f"Mismatching files were {sorted(comparison.differing)}\n"
+                            f"Unverified sizes were {sorted(comparison.unverified)}\n"
                         )
 
                     logger.info(f"Uploaded '{resource.path}' in '{session.name}'")

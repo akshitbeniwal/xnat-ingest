@@ -10,12 +10,14 @@ by XNAT's keys, so a file on XNAT that was never staged crashed the report.
 """
 
 import typing as ty
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from xnat_ingest.exceptions import IncompleteCheckumsException
-from xnat_ingest.helpers.remotes import get_xnat_resource
+from xnat_ingest.helpers.remotes import FileChecksums, get_xnat_resource
 
 
 class FakeResourceOnXnat:
@@ -39,6 +41,7 @@ class FakeStagedResource:
 
     name = "REPORT"
     scan = None
+    fileset = SimpleNamespace(parent=Path("/staged"))
     path = "test_project:SUBJ:SESS:REPORT"
 
     def __init__(self, checksums: dict[str, str]) -> None:
@@ -50,8 +53,15 @@ def _staged(n: int) -> dict[str, str]:
 
 
 def _call(staged: dict[str, str], on_xnat: dict[str, str]) -> ty.Any:
-    with mock.patch(
-        "xnat_ingest.helpers.remotes.get_xnat_checksums", return_value=on_xnat
+    with (
+        mock.patch(
+            "xnat_ingest.helpers.remotes.file_sizes",
+            return_value={name: 1 for name in staged},
+        ),
+        mock.patch(
+            "xnat_ingest.helpers.remotes.get_xnat_checksums",
+            return_value=FileChecksums(on_xnat, sizes={name: 1 for name in on_xnat}),
+        ),
     ):
         return get_xnat_resource(FakeStagedResource(staged), FakeXnatSession())
 
@@ -81,7 +91,10 @@ def test_extra_files_on_xnat_do_not_raise_keyerror() -> None:
     on_xnat = dict(staged)
     on_xnat["surprise.pdf"] = "digestX"
 
-    assert _call(staged, on_xnat) == (None, None), "must report, not crash"
+    with pytest.raises(
+        IncompleteCheckumsException, match="cannot be reported complete"
+    ):
+        _call(staged, on_xnat)
 
 
 def test_missing_alongside_extra_still_raises() -> None:

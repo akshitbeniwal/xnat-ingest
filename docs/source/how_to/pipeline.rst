@@ -448,3 +448,22 @@ confirm nothing was dropped.
     $ xnat-ingest check-upload /data/staging/assigned xnat.example.org
 
 It takes the same ``STAGED``/``SERVER``/credential options as ``upload``.
+
+Completion when checksums are unavailable
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+XNAT can list files without digests when site checksums are disabled or its
+catalog has not yet been refreshed. Matching filenames alone does not verify an
+upload: a truncated file still has the same name. The uploader then requires
+matching byte sizes from the staged files (or S3 object metadata) and the XNAT
+file listing. Missing or invalid sizes leave the resource unverified; differing
+sizes leave it incomplete. These conditions do not report a successful upload
+or automatically overwrite the conflicting files.
+
+This applies to session fast-skips, repeated imports, upload verification and
+``check-upload``. ``--dont-check-checksums`` avoids hashing file contents, but
+still verifies filenames and byte sizes after upload.
+
+Equal sizes are not proof of identical contents. Enable XNAT checksums when
+content-level verification is required; size validation detects truncation but
+cannot detect a same-size content change without a digest.

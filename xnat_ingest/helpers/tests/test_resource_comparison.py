@@ -51,20 +51,26 @@ def test_missing_and_differing_together_is_not_repairable() -> None:
     assert not c.repairable, "content conflict must still need a human"
 
 
-def test_empty_digests_fall_back_to_names_only() -> None:
+def test_empty_digests_need_matching_sizes() -> None:
     """XNAT leaves `digest` empty until a catalog refresh populates it.
 
     Comparing content in that state would call every healthy resource corrupt.
     """
     c = compare_resource_with_xnat(LOCAL, {k: "" for k in LOCAL})
     assert not c.comparable
-    assert c.complete, "names all present, so nothing is actually wrong"
+    assert not c.complete
+    assert c.unverified == set(LOCAL)
     assert not c.differing, "cannot claim a difference with nothing to compare"
 
 
 def test_empty_digests_still_detect_a_genuinely_missing_file() -> None:
     """Names are trustworthy even when digests are not."""
-    c = compare_resource_with_xnat(LOCAL, {"a.dcm": "", "b.dcm": ""})
+    c = compare_resource_with_xnat(
+        LOCAL,
+        {"a.dcm": "", "b.dcm": ""},
+        local_sizes={"a.dcm": 1, "b.dcm": 1},
+        xnat_sizes={"a.dcm": 1, "b.dcm": 1},
+    )
     assert not c.comparable
     assert c.missing == {"c.dcm"}
     assert c.repairable, "a missing name is still a missing name"

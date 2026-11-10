@@ -41,6 +41,73 @@ from .xnat_scan_types import (
 DEFAULT_MAX_WORKERS = 10
 
 
+class FileChecksums(dict[str, str]):
+    """Checksums with the byte sizes from the same file-listing snapshot.
+
+    Remains a dict for callers that only need digests. Sizes let callers verify
+    files for which XNAT has not computed a digest, without another REST read.
+    """
+
+    def __init__(
+        self,
+        checksums: ty.Mapping[str, str] | ty.Iterable[tuple[str, str]] = (),
+        *,
+        sizes: ty.Mapping[str, int] | None = None,
+    ) -> None:
+        super().__init__(checksums)
+        self.sizes = dict(sizes or {})
+
+
+def file_sizes(root: Path, names: ty.Iterable[str]) -> dict[str, int]:
+    """Stat exactly the manifest's files, retaining resource-relative paths.
+
+    Follow file symlinks, as the uploader does when staging their target bytes.
+    Do not let an untrusted manifest make this read outside the staging root by
+    means of an absolute path or a parent traversal.
+    """
+    sizes = {}
+    for name in names:
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"File path is not resource-relative: {name!r}")
+        source = root / path
+        if not source.is_file():
+            raise ValueError(f"Staged file is missing or not a regular file: {source}")
+        sizes[name] = source.stat().st_size
+    return sizes
+
+
+def compare_staged_resource(
+    resource: ImagingResource, remote: ty.Mapping[str, str]
+) -> "ResourceComparison":
+    """Compare with local byte sizes when either side lacks a usable digest."""
+    unchecked = {
+        name
+        for name in resource.checksums.keys() & remote.keys()
+        if not (resource.checksums[name] and remote[name])
+    }
+    try:
+        sizes = file_sizes(resource.fileset.parent, unchecked) if unchecked else {}
+    except (OSError, ValueError) as error:
+        raise IncompleteCheckumsException(
+            f"Cannot verify staged file sizes for '{resource.path}': {error}"
+        ) from error
+    return compare_resource_with_xnat(resource.checksums, remote, local_sizes=sizes)
+
+
+def require_verified_file_sizes(
+    comparison: "ResourceComparison", resource: str
+) -> None:
+    """Never turn an integrity failure into the caller's 'already uploaded'."""
+    if comparison.size_differing or comparison.unverified:
+        raise IncompleteCheckumsException(
+            f"Cannot verify '{resource}' as complete without checksums. "
+            f"Different file sizes: {sorted(comparison.size_differing)}; "
+            f"unavailable file sizes: {sorted(comparison.unverified)}. "
+            "Resolve the incomplete files before discarding the staged copy."
+        )
+
+
 @attrs.define
 class XnatRows:
     """One XNAT REST listing as plain rows, without xnatpy objects.
@@ -132,6 +199,12 @@ class SessionListing(metaclass=abc.ABCMeta):
                 manifest = Json(ImagingResource.manifest_fpath(resource_dir))
                 manifests[relpath] = manifest.contents
         return manifests
+
+    def resource_file_sizes(
+        self, resource_path: str, names: ty.Iterable[str]
+    ) -> dict[str, int]:
+        """Read local sizes without reading or hashing the file contents."""
+        return file_sizes(self.cache_path / resource_path, names)
 
     @property
     def ids(self):
@@ -250,8 +323,8 @@ class SessionListing(metaclass=abc.ABCMeta):
         # COMPLETE: one holding 5 of 8 files carries the same label as one
         # holding all 8, so labels alone cannot decide this.
         #
-        # Manifests are the source of truth for what should be there. A session
-        # staged without them is checked by resource path alone, as before.
+        # Manifests are the source of truth for what should be there. Without
+        # them, resource labels cannot establish completion.
         try:
             manifests = self.resource_manifests
         except Exception:  # noqa: BLE001 - see below, any failure means "unknown"
@@ -270,9 +343,9 @@ class SessionListing(metaclass=abc.ABCMeta):
             )
             return False
 
-        xnat_checksums_cache: dict[str, dict[str, str]] = {}
+        xnat_checksums_cache: dict[str, FileChecksums] = {}
 
-        def xnat_checksums(files_uri: str) -> dict[str, str]:
+        def xnat_checksums(files_uri: str) -> FileChecksums:
             if files_uri not in xnat_checksums_cache:
                 xnat_checksums_cache[files_uri] = get_xnat_checksums_at(
                     connection, files_uri
@@ -285,9 +358,29 @@ class SessionListing(metaclass=abc.ABCMeta):
             xresource = xresources.get(resource_path)
             if xresource is not None:
                 if not local_checksums:
-                    continue
+                    # An existing label is not evidence that its files arrived.
+                    return False
+                remote = xnat_checksums(xresource)
+                unchecked = {
+                    name
+                    for name in local_checksums.keys() & remote.keys()
+                    if not (local_checksums[name] and remote[name])
+                }
+                try:
+                    sizes = (
+                        self.resource_file_sizes(resource_path, unchecked)
+                        if unchecked
+                        else {}
+                    )
+                except (OSError, ValueError, AttributeError):
+                    logger.warning(
+                        "Cannot verify staged file sizes for '%s' in '%s'; not skipping",
+                        resource_path,
+                        self.name,
+                    )
+                    return False
                 comparison = compare_resource_with_xnat(
-                    local_checksums, xnat_checksums(xresource)
+                    local_checksums, remote, local_sizes=sizes
                 )
                 if not comparison.complete:
                     logger.info(
@@ -313,10 +406,26 @@ class SessionListing(metaclass=abc.ABCMeta):
                     if xscan_id == scan_id or xscan_id.startswith(f"{scan_id}-")
                     for xr in xrs
                 ]
-                if candidates and _files_held_in(
-                    local_checksums, [xnat_checksums(xr) for xr in candidates]
-                ):
-                    continue
+                if candidates:
+                    inventories = [xnat_checksums(xr) for xr in candidates]
+                    unchecked = {
+                        name
+                        for name, digest in local_checksums.items()
+                        if any(
+                            name in inventory and not (digest and inventory[name])
+                            for inventory in inventories
+                        )
+                    }
+                    try:
+                        sizes = (
+                            self.resource_file_sizes(resource_path, unchecked)
+                            if unchecked
+                            else {}
+                        )
+                    except (OSError, ValueError, AttributeError):
+                        return False
+                    if _files_held_in(local_checksums, inventories, local_sizes=sizes):
+                        continue
             logger.info(
                 "'%s' in '%s' was not found on XNAT. Not skipping the session.",
                 resource_path,
@@ -534,6 +643,23 @@ class S3SessionListing(SessionListing):
                 self.bucket.download_fileobj(obj.key, f)
             manifests[relpath] = Json(manifest_path).contents
         return manifests
+
+    def resource_file_sizes(
+        self, resource_path: str, names: ty.Iterable[str]
+    ) -> dict[str, int]:
+        """Use ListObjects byte sizes; checking a session must not download it."""
+        wanted = {resource_path + "/" + name: name for name in names}
+        sizes = {}
+        for parts, obj in self.objects:
+            key = "/".join(parts)
+            if key in wanted:
+                size = obj.size
+                if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                    raise ValueError(f"Invalid S3 object size for {key!r}")
+                if wanted[key] in sizes:
+                    raise ValueError(f"Duplicate S3 object path {key!r}")
+                sizes[wanted[key]] = size
+        return sizes
 
 
 def iterate_s3_sessions(
@@ -827,16 +953,23 @@ def _xnat_scan_class_from_session(xsession: ty.Any) -> ty.Any:
 def _files_held_in(
     local_checksums: ty.Mapping[str, str],
     xnat_checksums_list: ty.Iterable[ty.Mapping[str, str]],
+    *,
+    local_sizes: ty.Mapping[str, int] | None = None,
 ) -> bool:
     """Whether every staged file is held, by name and checksum, somewhere in the
-    given XNAT resources. As in compare_resource_with_xnat, a file XNAT has not
-    yet calculated a digest for ('') is matched by name only."""
-    held: dict[str, set[str]] = defaultdict(set)
-    for xnat_checksums in xnat_checksums_list:
-        for name, digest in xnat_checksums.items():
-            held[name].add(digest)
+    given XNAT resources. Files without digests must match by byte size."""
+    inventories = list(xnat_checksums_list)
     return all(
-        name in held and (checksum in held[name] or "" in held[name])
+        any(
+            name in inventory
+            and compare_resource_with_xnat(
+                {name: checksum},
+                {name: inventory[name]},
+                local_sizes=local_sizes,
+                xnat_sizes=getattr(inventory, "sizes", {}),
+            ).complete
+            for inventory in inventories
+        )
         for name, checksum in local_checksums.items()
     )
 
@@ -858,11 +991,13 @@ class ResourceComparison:
     differing: ty.Set[str] = attrs.field(factory=set)
     comparable: bool = True
     without_checksums: ty.Set[str] = attrs.field(factory=set)
+    size_differing: ty.Set[str] = attrs.field(factory=set)
+    unverified: ty.Set[str] = attrs.field(factory=set)
 
     @property
     def complete(self) -> bool:
         """XNAT holds everything we do, with nothing unexpected."""
-        return not (self.missing or self.extra or self.differing)
+        return not (self.missing or self.extra or self.differing or self.unverified)
 
     @property
     def repairable(self) -> bool:
@@ -872,21 +1007,29 @@ class ResourceComparison:
         uploading, so treating them as repairable would append to a resource
         that is already wrong.
         """
-        return bool(self.missing) and not self.extra and not self.differing
+        return (
+            bool(self.missing)
+            and not self.extra
+            and not self.differing
+            and not self.unverified
+        )
 
 
 def compare_resource_with_xnat(
     local_checksums: ty.Mapping[str, str],
     xnat_checksums: ty.Mapping[str, str],
+    *,
+    local_sizes: ty.Mapping[str, int] | None = None,
+    xnat_sizes: ty.Mapping[str, int] | None = None,
 ) -> ResourceComparison:
     """Compare a staged resource's manifest against XNAT's file listing.
 
     XNAT leaves `digest` empty until a catalog refresh populates it, so files
     uploaded but not yet refreshed report ''. Comparing content in that state
-    would call a healthy resource corrupt, so a file with no digest is compared
-    by NAME only and recorded in `without_checksums`. `comparable` means at
-    least one remote digest exists, not that every file was verified by content.
-    api/check_upload_api.py guards the same way.
+    would call a healthy resource corrupt. A file without a digest instead needs
+    equal byte sizes on both sides. Unknown sizes are unverified, never complete.
+    Equal sizes do not prove equal contents. `comparable` retains its historical
+    meaning that at least one remote digest exists.
     """
     local_names = set(local_checksums)
     xnat_names = set(xnat_checksums)
@@ -896,16 +1039,43 @@ def compare_resource_with_xnat(
         differing = {
             n
             for n in local_names & xnat_names
-            if xnat_checksums[n] and xnat_checksums[n] != local_checksums[n]
+            if xnat_checksums[n]
+            and local_checksums[n]
+            and xnat_checksums[n] != local_checksums[n]
         }
+    unchecked = {
+        n
+        for n in local_names & xnat_names
+        if not (local_checksums[n] and xnat_checksums[n])
+    }
+    local_sizes = (
+        local_sizes
+        if local_sizes is not None
+        else getattr(local_checksums, "sizes", {})
+    )
+    xnat_sizes = (
+        xnat_sizes if xnat_sizes is not None else getattr(xnat_checksums, "sizes", {})
+    )
+
+    def valid_size(value: ty.Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    unverified = {
+        n
+        for n in unchecked
+        if not valid_size(local_sizes.get(n)) or not valid_size(xnat_sizes.get(n))
+    }
+    size_differing = {
+        n for n in unchecked - unverified if local_sizes[n] != xnat_sizes[n]
+    }
     return ResourceComparison(
         missing=local_names - xnat_names,
         extra=xnat_names - local_names,
-        differing=differing,
+        differing=differing | size_differing,
         comparable=comparable,
-        without_checksums={
-            n for n in local_names & xnat_names if not xnat_checksums[n]
-        },
+        without_checksums=unchecked,
+        size_differing=size_differing,
+        unverified=unverified,
     )
 
 
@@ -917,6 +1087,8 @@ def warn_if_compared_by_name_only(
 ) -> None:
     """Report files compared without digests, including partially digested resources.
 
+    The historical function name is retained for caller compatibility; files
+    without digests now require byte-size evidence.
     The uploader shares a set across the pre/post checks of one session attempt.
     A later attempt can warn again; no state is retained across polling passes.
     """
@@ -926,12 +1098,12 @@ def warn_if_compared_by_name_only(
         if warned_resources is not None:
             warned_resources.add(resource)
         logger.warning(
-            # Keep this phrase stable: external log alerts may match it.
-            "'%s' in '%s' has %d file(s) compared by file name only: XNAT lists them "
-            "without checksums (site checksums off, or not computed yet)",
+            "'%s' in '%s' has %d file(s) without checksums; comparing file names "
+            "and byte sizes (%d size(s) unverified). Equal sizes do not verify content",
             resource,
             session,
             len(comparison.without_checksums),
+            len(comparison.unverified),
         )
 
 
@@ -1056,12 +1228,13 @@ def get_xnat_resource(
             # Same three outcomes as the scan branch below: repair, refuse, or
             # nothing to do. The caller reads None as "already uploaded", so
             # returning it for a short resource loses the data silently.
-            comparison = compare_resource_with_xnat(
-                resource.checksums, get_xnat_checksums(xresource)
+            comparison = compare_staged_resource(
+                resource, get_xnat_checksums(xresource)
             )
             warn_if_compared_by_name_only(
                 comparison, resource.path, xsession.label, warned_resources
             )
+            require_verified_file_sizes(comparison, resource.path)
             if comparison.repairable:
                 logger.warning(
                     "'%s' session resource exists on XNAT but is missing %d of "
@@ -1097,6 +1270,10 @@ def get_xnat_resource(
                         f"uploaded afresh. Missing: {sorted(comparison.missing)[:10]}"
                         + ("..." if len(comparison.missing) > 10 else "")
                     )
+                raise IncompleteCheckumsException(
+                    f"'{resource_name}' in '{resource.path}' has unexpected or "
+                    "differing files on XNAT and cannot be reported complete."
+                )
             return None, None
         logger.debug(
             "Creating session resource %s in %s", resource_name, xsession.label
@@ -1196,10 +1373,11 @@ def get_xnat_resource(
         pass
     else:
         xnat_checksums = get_xnat_checksums(xresource)
-        comparison = compare_resource_with_xnat(resource.checksums, xnat_checksums)
+        comparison = compare_staged_resource(resource, xnat_checksums)
         warn_if_compared_by_name_only(
             comparison, resource.path, resource.scan.path, warned_resources
         )
+        require_verified_file_sizes(comparison, resource.path)
         if comparison.repairable:
             # We hold files XNAT does not and nothing else is wrong, so hand
             # back the shortfall. Not the whole resource: XNAT would reject or
@@ -1218,7 +1396,6 @@ def get_xnat_resource(
             return xresource, comparison.missing
         if not comparison.complete:
             logger.error(
-                # Keep this phrase stable: external log alerts may match it.
                 "'%s' resource in '%s' already exists on XNAT with different "
                 "checksums.\nMissing paths: %s\nAdditional paths: %s\n"
                 "Differing paths: %s",
@@ -1260,6 +1437,10 @@ def get_xnat_resource(
                     resource.scan.path,
                     pprint.pformat(difference),
                 )
+            raise IncompleteCheckumsException(
+                f"'{resource_name}' in '{resource.scan.path}' has unexpected or "
+                "differing files on XNAT and cannot be reported complete."
+            )
         # Ensure that catalog is rebuilt if the file counts are 0
         if not xscan.files:
             xresource.xnat_session.post(
@@ -1283,9 +1464,9 @@ def get_xnat_resource(
     return xresource, None
 
 
-def get_xnat_checksums(xresource: ty.Any) -> dict[str, str]:
+def get_xnat_checksums(xresource: ty.Any) -> FileChecksums:
     """
-    Downloads the MD5 digests associated with the files in a resource.
+    Download the MD5 digests and byte sizes of the files in a resource.
 
     Parameters
     ----------
@@ -1294,8 +1475,8 @@ def get_xnat_checksums(xresource: ty.Any) -> dict[str, str]:
 
     Returns
     -------
-    dict[str, str]
-        the checksums calculated by XNAT
+    FileChecksums
+        XNAT digests keyed by relative path, with available sizes in ``.sizes``
     """
     return get_xnat_checksums_at(
         xresource.xnat_session, xresource.uri + "/files", xresource.id
@@ -1304,7 +1485,7 @@ def get_xnat_checksums(xresource: ty.Any) -> dict[str, str]:
 
 def get_xnat_checksums_at(
     connection: xnat.XNATSession, files_uri: str, resource_id: ty.Any = None
-) -> dict[str, str]:
+) -> FileChecksums:
     """get_xnat_checksums() for a resource given by the URI of its file listing.
 
     Parameters
@@ -1318,8 +1499,8 @@ def get_xnat_checksums_at(
 
     Returns
     -------
-    dict[str, str]
-        the checksums calculated by XNAT
+    FileChecksums
+        XNAT digests keyed by relative path, with available sizes in ``.sizes``
     """
     result = connection.get(files_uri)
     if result.status_code != 200:
@@ -1329,7 +1510,7 @@ def get_xnat_checksums_at(
                 files_uri if resource_id is None else resource_id
             )
         )
-    checksums: dict[str, str] = {}
+    checksums = FileChecksums()
     for row in result.json()["ResultSet"]["Result"]:
         # Name is only the basename. URI retains the path inside the resource,
         # and its resource identifier may be numeric even when we queried by label.
@@ -1354,7 +1535,20 @@ def get_xnat_checksums_at(
             raise ValueError(
                 f"XNAT file listing repeats resource-relative path {path!r}"
             )
-        checksums[path] = row["digest"]
+        checksums[path] = row.get("digest") or ""
+        if row.get("Size") is not None:
+            size = row["Size"]
+            if not isinstance(size, (int, str)) or isinstance(size, bool):
+                raise ValueError(f"Invalid XNAT file size for {path!r}: {size!r}")
+            try:
+                size = int(size)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid XNAT file size for {path!r}: {size!r}"
+                ) from error
+            if size < 0:
+                raise ValueError(f"Negative XNAT file size for {path!r}")
+            checksums.sizes[path] = size
     return checksums
 
 
